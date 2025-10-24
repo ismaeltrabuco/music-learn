@@ -1,93 +1,68 @@
-import sounddevice as sd
+import cv2
 import numpy as np
+import base64
+import io
 import librosa
-import time
+import streamlit as st
+from scipy.stats import beta
+import sounddevice as sd
 from collections import Counter
 
-# Program Description: Records audio input, detects notes, and analyzes if the student played a C major scale (C D E F G A B C) melodically in 4/4 time.
-
-# --- CONFIGURABLE SCALE ---
-# Change this list to analyze a different scale (e.g., ['D', 'E', 'F#', 'G', 'A', 'B', 'C#', 'D'] for D major)
+# Configurable scale
 TARGET_SCALE = ['C', 'D', 'E', 'F', 'G', 'A', 'B', 'C']
-
-# --- NOTE FREQUENCY MAPPING ---
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
-def freq_to_note(freq, threshold=50.0):
-    """
-    Convert frequency to note name with minimum frequency threshold
-    """
-    if freq < threshold:  # Ignore very low frequencies (likely noise)
-        return None
-    
+# Decode base64 to video file
+def decode_base64_video(base64_clip):
+    if base64_clip.startswith('data:video/webm;'):
+        base64_clip = base64_clip.split(',')[1]
+    video_bytes = base64.b64decode(base64_clip)
+    video_path = 'temp.webm'
+    with open(video_path, 'wb') as f:
+        f.write(video_bytes)
+    return video_path
+
+# Extract audio from video
+def extract_audio(video_path):
     try:
-        # MIDI note number calculation
+        y, sr = librosa.load(video_path, sr=22050)
+        return y, sr
+    except Exception as e:
+        st.error(f"Error extracting audio: {e}")
+        return None, 22050
+
+# Frequency to note conversion
+def freq_to_note(freq, threshold=50.0):
+    if freq < threshold:
+        return None
+    try:
         midi = int(round(69 + 12 * np.log2(freq / 440.0)))
-        
-        # Ensure MIDI is in reasonable range (C0 to B8)
         if midi < 12 or midi > 127:
             return None
-            
-        note = NOTE_NAMES[midi % 12]
-        return note
+        return NOTE_NAMES[midi % 12]
     except (ValueError, OverflowError):
         return None
 
-def record_audio(duration=8, fs=22050):
-    """
-    Record audio with error handling
-    """
-    print(f"Recording for {duration} seconds...")
-    try:
-        audio = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype='float32')
-        sd.wait()
-        return audio.flatten(), fs
-    except Exception as e:
-        print(f"Error during recording: {e}")
-        return None, fs
-
-def detect_notes(y, sr, hop_length=512, frame_length=2048):
-    """
-    Detect notes with improved filtering and minimum duration
-    """
+# Analyze C Major scale
+def analyze_scale(y, sr):
     if y is None or len(y) == 0:
-        return []
+        return 0.0, "No audio detected"
     
-    # Use harmonic component for better pitch detection
     y_harmonic = librosa.effects.hpss(y)[0]
+    pitches, magnitudes = librosa.piptrack(y=y_harmonic, sr=sr, hop_length=512, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), threshold=0.1)
     
-    # Detect pitches
-    pitches, magnitudes = librosa.piptrack(
-        y=y_harmonic, 
-        sr=sr, 
-        hop_length=hop_length,
-        fmin=librosa.note_to_hz('C2'),  # Minimum frequency (C2)
-        fmax=librosa.note_to_hz('C7'),  # Maximum frequency (C7)
-        threshold=0.1
-    )
-    
-    notes_with_confidence = []
-    
+    notes = []
     for i in range(pitches.shape[1]):
-        # Find the strongest pitch in this frame
-        if magnitudes[:, i].max() > 0.1:  # Minimum confidence threshold
+        if magnitudes[:, i].max() > 0.1:
             index = magnitudes[:, i].argmax()
             freq = pitches[index, i]
-            confidence = magnitudes[index, i]
-            
             note = freq_to_note(freq)
-            if note and confidence > 0.2:  # Additional confidence filter
-                notes_with_confidence.append((note, confidence))
+            if note and magnitudes[index, i] > 0.2:
+                notes.append(note)
     
-    # Extract just the notes
-    notes = [note for note, _ in notes_with_confidence]
-    
-    # Remove consecutive duplicates and filter short notes
     filtered_notes = []
-    current_note = None
-    note_count = 0
-    min_duration = 3  # Minimum frames for a note to be considered valid
-    
+    current_note, note_count = None, 0
+    min_duration = 3
     for note in notes:
         if note == current_note:
             note_count += 1
@@ -96,79 +71,96 @@ def detect_notes(y, sr, hop_length=512, frame_length=2048):
                 filtered_notes.append(current_note)
             current_note = note
             note_count = 1
-    
-    # Don't forget the last note
     if current_note and note_count >= min_duration:
         filtered_notes.append(current_note)
     
-    return filtered_notes
+    played = filtered_notes[:len(TARGET_SCALE)]
+    correct_count = sum(1 for i, note in enumerate(played) if i < len(TARGET_SCALE) and note == TARGET_SCALE[i])
+    score = correct_count / len(TARGET_SCALE) if played else 0.0
+    a, b = 1 + score * 10, 1 + (1 - score) * 10
+    feedback = "Escala Dó Maior correta!" if played == TARGET_SCALE else f"Escala incompleta: {correct_count}/{len(TARGET_SCALE)} notas corretas"
+    return beta.rvs(a, b), feedback
 
-def analyze_scale(played_notes, target_scale):
-    """
-    Analyze if the played notes match the target scale
-    """
-    if not played_notes:
-        print("No notes detected. Please try again with clearer playing.")
-        return
-    
-    # Only consider the first len(target_scale) notes
-    played = played_notes[:len(target_scale)]
-    
-    print(f"Detected notes: {played}")
-    print(f"Expected scale: {target_scale}")
-    print(f"Total notes detected: {len(played_notes)}")
-    
-    if len(played) < len(target_scale):
-        print(f"Incomplete scale: Only {len(played)} out of {len(target_scale)} notes detected.")
-        print("Try playing more clearly or for a longer duration.")
-        return
-    
-    # Check exact match
-    if played == target_scale:
-        print("✅ Success: C Major scale played correctly!")
-    else:
-        print("❌ Try again: The scale was not played correctly.")
+# Analyze posture
+def analyze_posture(frames):
+    avg_frame = np.mean(frames, axis=0).astype(np.uint8)
+    gray = cv2.cvtColor(avg_frame, cv2.COLOR_BGR2GRAY)
+    kernel = np.ones((5,5), np.uint8)
+    gray = cv2.dilate(gray, kernel, iterations=1)
+    edges = cv2.Canny(gray, 100, 200)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    posture_score = len(contours) / 100.0 if contours else 0.5
+    a, b = 1 + posture_score * 10, 1 + (1 - posture_score) * 10
+    return beta.rvs(a, b), "Boa postura" if posture_score > 0.5 else "Melhorar postura"
+
+# Detect guitar with improved template matching
+def detect_guitar(frames):
+    avg_frame = np.mean(frames, axis=0).astype(np.uint8)
+    gray = cv2.cvtColor(avg_frame, cv2.COLOR_BGR2GRAY)
+    kernel = np.ones((3,3), np.uint8)
+    gray = cv2.GaussianBlur(gray, (5,5), 0)
+    edges = cv2.Canny(gray, 50, 150)
+    # Assume guitar has distinct edge patterns
+    has_guitar = np.mean(edges) > 20
+    a, b = 1 + has_guitar * 10, 1 + (1 - has_guitar) * 10
+    return beta.rvs(a, b) > 0.5, "Violão detectado" if has_guitar else "Sem violão"
+
+# Analyze frame
+def analyze_frame(frames):
+    avg_frame = np.mean(frames, axis=0).astype(np.uint8)
+    gray = cv2.cvtColor(avg_frame, cv2.COLOR_BGR2GRAY)
+    kernel = np.ones((3,3), np.uint8)
+    gray = cv2.GaussianBlur(gray, (5,5), 0)
+    sobel = cv2.Sobel(gray, cv2.CV_64F, 1, 1, ksize=5)
+    complexity = np.std(sobel)
+    occupation = complexity / 255
+    h, w = gray.shape
+    center_dist = np.mean([np.sqrt((i - h/2)**2 + (j - w/2)**2) for i in range(h) for j in range(w) if gray[i,j] > 100])
+    organized = occupation < 0.5 and center_dist > 100
+    a, b = 1 + organized * 10, 1 + (1 - organized) * 10
+    return beta.rvs(a, b), "Quadro organizado" if organized else "Quadro confuso"
+
+# Analyze facial expressions
+def analyze_facial(frames):
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    faces = 0
+    for frame in frames:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        kernel = np.ones((3,3), np.uint8)
+        gray = cv2.dilate(gray, kernel, iterations=1)
+        detected = face_cascade.detectMultiScale(gray, 1.3, 5)
+        faces += len(detected)
+    score = faces / len(frames)
+    a, b = 1 + score * 10, 1 + (1 - score) * 10
+    return beta.rvs(a, b), "Expressões capturadas" if score > 0.5 else "Melhorar expressões"
+
+# Streamlit App
+st.title('Plexo Natural Clip Analyzer')
+
+base64_clip = st.text_area('Paste Base64 Clip')
+if base64_clip:
+    video_path = decode_base64_video(base64_clip)
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(frame)
+    cap.release()
+
+    if frames:
+        st.video(video_path)  # Live frame preview
+        y, sr = extract_audio(video_path)
         
-        # Provide detailed feedback
-        correct_count = sum(1 for i, note in enumerate(played) if i < len(target_scale) and note == target_scale[i])
-        print(f"Accuracy: {correct_count}/{len(target_scale)} notes correct")
+        report = {
+            'scale': analyze_scale(y, sr),
+            'posture': analyze_posture(frames),
+            'has_guitar': detect_guitar(frames),
+            'frame': analyze_frame(frames),
+            'facial': analyze_facial(frames)
+        }
         
-        # Show differences
-        for i, (expected, actual) in enumerate(zip(target_scale, played)):
-            status = "✅" if expected == actual else "❌"
-            print(f"  Position {i+1}: Expected {expected}, Got {actual} {status}")
-
-def main():
-    """
-    Main function with improved user interaction
-    """
-    print("=" * 50)
-    print("C MAJOR SCALE ANALYZER")
-    print("=" * 50)
-    print("Instructions:")
-    print("- Play the C major scale: C D E F G A B C")
-    print("- Play melodically (one note at a time)")
-    print("- Keep a steady tempo")
-    print("- Recording will start in 3 seconds...")
-    print("=" * 50)
-    
-    # Countdown
-    for i in range(3, 0, -1):
-        print(f"Starting in {i}...")
-        time.sleep(1)
-    
-    print("🎵 Recording started!")
-    audio, fs = record_audio()
-    
-    if audio is not None:
-        print("🔍 Analyzing notes...")
-        notes = detect_notes(audio, fs)
-        analyze_scale(notes, TARGET_SCALE)
+        st.json(report)
     else:
-        print("❌ Recording failed. Please check your audio device.")
-    
-    print("\nPress Enter to exit...")
-    input()
-
-if __name__ == "__main__":
-    main()
+        st.error('No frames in video')
